@@ -1,0 +1,272 @@
+import { useInfiniteQuery, useMutation, useQueryClient, type InfiniteData } from '@tanstack/react-query';
+import type { Message, Reaction } from '@/stores/workspace';
+import { useCurrentApi } from '@/shared/hooks/useCurrentApi';
+import { QUERY_KEYS, MESSAGES_PAGE_SIZE, ErrorLabels } from '@/shared/constants';
+import { upsertMessage, patchMessageById, newestFirst, removeMessageById } from '@/lib/messageCache';
+import { toast } from '@/shared/components/Toast';
+import { logger } from '@/lib/logger';
+
+export interface MessagesResponse {
+  data: Message[];
+}
+
+export type MessagesInfiniteData = InfiniteData<MessagesResponse>;
+
+export function messagesOldestFirst(data: MessagesInfiniteData | undefined): Message[] {
+  if (!data) return [];
+  return [...data.pages].reverse().flatMap((page) => page.data);
+}
+
+export function olderMessagesCursor(page: MessagesResponse): string | undefined {
+  if (page.data.length < MESSAGES_PAGE_SIZE) return undefined;
+  const oldest = page.data[page.data.length - 1];
+  return oldest?.id;
+}
+
+export const useMessages = (channelId: string | null) => {
+  const apiClient = useCurrentApi();
+
+  return useInfiniteQuery({
+    queryKey: QUERY_KEYS.messages(channelId ?? ''),
+    queryFn: async ({ pageParam }): Promise<MessagesResponse> => {
+      if (!channelId) throw new Error('No channel selected');
+      return apiClient.typed((c) =>
+        c.GET('/channels/{ch_id}/messages', {
+          params: { path: { ch_id: channelId }, query: { limit: MESSAGES_PAGE_SIZE, cursor: pageParam } },
+        }),
+      );
+    },
+    getNextPageParam: olderMessagesCursor,
+    initialPageParam: undefined as string | undefined,
+    enabled: !!channelId,
+    staleTime: 0,
+    select: (data) => ({
+      ...data,
+      pages: data.pages.map((page) => ({ ...page, data: [...page.data].reverse() })),
+    }),
+  });
+};
+
+export const useSendMessage = (channelId: string, userId: string) => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+  const key = QUERY_KEYS.messages(channelId);
+
+  return useMutation({
+    mutationFn: async ({ content, id }: { content: string; id: string }) => {
+      // The server owns the message id; this one only makes a retry of the same
+      // send idempotent, and is scoped to this channel.
+      return apiClient.typed((c) =>
+        c.POST('/channels/{ch_id}/messages', {
+          params: { path: { ch_id: channelId } },
+          body: { content, client_message_id: id },
+        }),
+      );
+    },
+    onMutate: async ({ content, id }) => {
+      await queryClient.cancelQueries({ queryKey: key });
+      const optimistic: Message = {
+        id,
+        channel_id: channelId,
+        user_id: userId,
+        client_message_id: id,
+        content,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        deleted_at: null,
+        thread_parent_id: null,
+        reply_count: 0,
+        is_pinned: false,
+        pending: true,
+      };
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        upsertMessage(old, optimistic, 'lastPage', newestFirst),
+      );
+      return { id };
+    },
+    onError: (err, { id }) => {
+      logger.error('useSendMessage', 'mutationFn', err);
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        patchMessageById(old, id, (m) => ({ ...m, pending: false, failed: true })),
+      );
+      toast.error(ErrorLabels.SendFailed);
+    },
+    onSuccess: (message, { id }) => {
+      // The optimistic row was keyed on the client id, the stored row is keyed
+      // on the server's. Swapping them here is what stops the websocket echo
+      // from arriving as a second copy of the same message.
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        upsertMessage(
+          removeMessageById(old, id),
+          { ...message, pending: false, failed: false },
+          'lastPage',
+          newestFirst,
+        ),
+      );
+    },
+  });
+};
+
+export const useEditMessage = () => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+
+  return useMutation({
+    mutationFn: async ({ messageId, content }: { messageId: string; content: string; channelId: string }) => {
+      return apiClient.typed((c) =>
+        c.PATCH('/messages/{msg_id}', { params: { path: { msg_id: messageId } }, body: { content } }),
+      );
+    },
+    onMutate: async ({ messageId, content, channelId }) => {
+      const key = QUERY_KEYS.messages(channelId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<MessagesInfiniteData>(key);
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        patchMessageById(old, messageId, (m) => ({ ...m, content, updated_at: new Date().toISOString() })),
+      );
+      return { previous, channelId };
+    },
+    onError: (err, _vars, ctx) => {
+      logger.error('useEditMessage', 'mutationFn', err);
+      if (ctx?.previous) queryClient.setQueryData(QUERY_KEYS.messages(ctx.channelId), ctx.previous);
+      toast.error(ErrorLabels.EditFailed);
+    },
+  });
+};
+
+export const useDeleteMessage = () => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+
+  return useMutation({
+    mutationFn: async ({ messageId }: { messageId: string; channelId: string }) => {
+      await apiClient.typed((c) =>
+        c.DELETE('/messages/{msg_id}', { params: { path: { msg_id: messageId } } }),
+      );
+    },
+    onSuccess: (_data, { messageId, channelId }) => {
+      queryClient.setQueryData<MessagesInfiniteData>(QUERY_KEYS.messages(channelId), (old) =>
+        patchMessageById(old, messageId, (m) => ({ ...m, deleted_at: new Date().toISOString() })),
+      );
+    },
+    onError: (err) => {
+      logger.error('useDeleteMessage', 'mutationFn', err);
+      toast.error(ErrorLabels.DeleteFailed);
+    },
+  });
+};
+
+interface ReactionVars {
+  messageId: string;
+  channelId: string;
+  emoji: string;
+  userId: string;
+}
+
+export const usePinMessage = () => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+
+  return useMutation({
+    mutationFn: async ({
+      messageId,
+      isPinned,
+    }: {
+      messageId: string;
+      channelId: string;
+      isPinned: boolean;
+    }) => {
+      const params = { path: { msg_id: messageId } };
+      if (isPinned) await apiClient.typed((c) => c.DELETE('/messages/{msg_id}/pin', { params }));
+      else await apiClient.typed((c) => c.POST('/messages/{msg_id}/pin', { params }));
+    },
+    onMutate: async ({ messageId, channelId, isPinned }) => {
+      const key = QUERY_KEYS.messages(channelId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<MessagesInfiniteData>(key);
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        patchMessageById(old, messageId, (m) => ({ ...m, is_pinned: !isPinned })),
+      );
+      return { previous, channelId };
+    },
+    onError: (err, _vars, ctx) => {
+      logger.error('usePinMessage', 'mutationFn', err);
+      if (ctx?.previous) queryClient.setQueryData(QUERY_KEYS.messages(ctx.channelId), ctx.previous);
+      toast.error(ErrorLabels.PinFailed);
+    },
+    onSettled: (_data, _err, { channelId }) => {
+      queryClient.invalidateQueries({ queryKey: QUERY_KEYS.channelPins(channelId) });
+    },
+  });
+};
+
+export const useReactToMessage = () => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+
+  return useMutation({
+    mutationFn: async ({ messageId, emoji }: ReactionVars) => {
+      return apiClient.typed((c) =>
+        c.POST('/messages/{msg_id}/reactions', { params: { path: { msg_id: messageId } }, body: { emoji } }),
+      );
+    },
+    onMutate: async ({ messageId, channelId, emoji, userId }) => {
+      const key = QUERY_KEYS.messages(channelId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const optimistic: Reaction = {
+        id: `optimistic-${crypto.randomUUID()}`,
+        message_id: messageId,
+        user_id: userId,
+        emoji,
+        created_at: new Date().toISOString(),
+      };
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        patchMessageById(old, messageId, (m) => {
+          const reactions = m.reactions ?? [];
+          if (reactions.some((r) => r.user_id === userId && r.emoji === emoji)) return m;
+          return { ...m, reactions: [...reactions, optimistic] };
+        }),
+      );
+    },
+    onError: (err, { messageId, channelId, emoji, userId }) => {
+      logger.error('useReactToMessage', 'mutationFn', err);
+      queryClient.setQueryData<MessagesInfiniteData>(QUERY_KEYS.messages(channelId), (old) =>
+        patchMessageById(old, messageId, (m) => ({
+          ...m,
+          reactions: (m.reactions ?? []).filter((r) => !(r.user_id === userId && r.emoji === emoji)),
+        })),
+      );
+      toast.error(ErrorLabels.ReactionFailed);
+    },
+  });
+};
+
+export const useRemoveReaction = () => {
+  const queryClient = useQueryClient();
+  const apiClient = useCurrentApi();
+
+  return useMutation({
+    mutationFn: async ({ messageId, emoji }: ReactionVars) => {
+      return apiClient.typed((c) =>
+        c.DELETE('/messages/{msg_id}/reactions/{emoji}', { params: { path: { msg_id: messageId, emoji } } }),
+      );
+    },
+    onMutate: async ({ messageId, channelId, emoji, userId }) => {
+      const key = QUERY_KEYS.messages(channelId);
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<MessagesInfiniteData>(key);
+      queryClient.setQueryData<MessagesInfiniteData>(key, (old) =>
+        patchMessageById(old, messageId, (m) => ({
+          ...m,
+          reactions: (m.reactions ?? []).filter((r) => !(r.user_id === userId && r.emoji === emoji)),
+        })),
+      );
+      return { previous, channelId };
+    },
+    onError: (err, _vars, ctx) => {
+      logger.error('useRemoveReaction', 'mutationFn', err);
+      if (ctx?.previous) queryClient.setQueryData(QUERY_KEYS.messages(ctx.channelId), ctx.previous);
+      toast.error(ErrorLabels.ReactionFailed);
+    },
+  });
+};

@@ -1,0 +1,113 @@
+import { expect, request as playwrightRequest, type APIRequestContext, type Page } from '@playwright/test';
+
+export const API = process.env.E2E_API_URL || 'http://localhost:3000/api';
+export const PASSWORD = process.env.E2E_PASSWORD || 'admin123456';
+export const SHOTS = process.env.E2E_SHOTS || '/tmp/shots';
+export const MAILHOG = process.env.E2E_MAILHOG_URL || 'http://localhost:8025';
+
+interface Session {
+  token: string;
+  userId: string;
+}
+
+const sessionCache = new Map<string, Session>();
+
+async function signIn(request: APIRequestContext, email: string): Promise<Session> {
+  const cached = sessionCache.get(email);
+  if (cached) return cached;
+  const res = await request.post(`${API}/auth/login`, { data: { email, password: PASSWORD } });
+  expect(res.status(), `login for ${email}`).toBe(200);
+  const body = await res.json();
+  const session = { token: body.access_token as string, userId: body.user.id as string };
+  sessionCache.set(email, session);
+  return session;
+}
+
+export async function apiToken(request: APIRequestContext, email: string) {
+  return (await signIn(request, email)).token;
+}
+
+export async function authHeaders(request: APIRequestContext, email: string) {
+  return { Authorization: `Bearer ${await apiToken(request, email)}` };
+}
+
+/**
+ * A request context that acts as one user. The API prefers the session cookie over the
+ * Authorization header, so tests that share a context end up acting as whoever logged in
+ * last; a per-user context with a cached bearer token keeps identities apart and costs a
+ * single login per user per run (the login limiter allows ten).
+ */
+export async function userContext(email: string) {
+  const anonymous = await playwrightRequest.newContext();
+  const session = await signIn(anonymous, email);
+  await anonymous.dispose();
+
+  const ctx = await playwrightRequest.newContext({
+    extraHTTPHeaders: { Authorization: `Bearer ${session.token}` },
+  });
+  return { ctx, userId: session.userId };
+}
+
+/**
+ * The seeded workspace, by name rather than by position. `data[0]` is whichever
+ * workspace sorts first, so an import — or anything else that creates one —
+ * silently pointed the whole suite at the wrong place.
+ */
+export async function devWorkspace(request: APIRequestContext, email?: string) {
+  // Playwright's bare `request` fixture carries no session; a context from
+  // `userContext` does. Naming the user covers both.
+  const headers = email ? await authHeaders(request, email) : undefined;
+  const listed = await (await request.get(`${API}/workspaces`, { headers })).json();
+  const workspace = listed.data.find((w: { name: string }) => w.name === 'Dev Team');
+  expect(workspace, 'the seeded "Dev Team" workspace').toBeTruthy();
+  return workspace as { id: string; name: string; slug: string };
+}
+
+/** A channel of this test's own, so a spec never asserts on rows another spec is writing. */
+export async function createChannel(ctx: APIRequestContext, workspaceId: string, prefix: string) {
+  const res = await ctx.post(`${API}/workspaces/${workspaceId}/channels`, {
+    data: { name: `${prefix}-${Date.now()}`, channel_type: 'public' },
+  });
+  expect(res.status(), `create channel ${prefix}`).toBe(200);
+  return (await res.json()) as { id: string; name: string };
+}
+
+export async function login(page: Page, email: string) {
+  await page.goto('/');
+  await page.locator('#email').fill(email);
+  await page.locator('#password').fill(PASSWORD);
+
+  // Wait on the sign-in response, not just on the composer appearing. A 429 from
+  // the login limiter or a 502 from a stale proxy used to spend the full 20s
+  // timeout on every test in the run; this turns a broken environment into one
+  // failure that says what happened.
+  const response = page.waitForResponse(
+    (r) => r.url().includes('/api/auth/login') && r.request().method() === 'POST',
+    { timeout: 20_000 },
+  );
+  await page.getByRole('button', { name: 'Connect' }).click();
+  const signIn = await response;
+  expect(signIn.status(), `sign-in for ${email} returned ${signIn.status()}`).toBe(200);
+
+  await expect(page.locator('.ProseMirror[contenteditable="true"]').last()).toBeVisible({ timeout: 20_000 });
+}
+
+export async function send(page: Page, text: string) {
+  const editor = page.locator('.ProseMirror[contenteditable="true"]').last();
+  await editor.click();
+  await editor.fill(text);
+  await editor.press('Enter');
+}
+
+export async function inviteEmailBody(request: APIRequestContext, email: string): Promise<string> {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const mail = await request.get(`${MAILHOG}/api/v2/search?kind=to&query=${encodeURIComponent(email)}`);
+    const items = (await mail.json()).items;
+    if (items.length > 0) {
+      return items[0].Content.Body.replace(/=\r\n/g, '').replace(/=3D/g, '=');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`no email for ${email} arrived in MailHog within 20s`);
+}

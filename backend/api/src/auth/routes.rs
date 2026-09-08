@@ -1,0 +1,518 @@
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::http::header::AUTHORIZATION;
+use axum::http::HeaderMap;
+use axum::Json;
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use chrono::Utc;
+use garde::Validate;
+use shared_common::errors::{AppError, AppResult};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use super::models::*;
+use crate::audit::{self, AuditAction, AuditEntry};
+use crate::dto::StatusResponse;
+use crate::middleware::AuthUser;
+use crate::middleware::PeerAddr;
+use crate::state::AppState;
+use crate::workspace::models::WorkspaceRole;
+
+pub fn router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(get_me, update_me))
+        .routes(routes!(change_password))
+        .routes(routes!(set_status, clear_status))
+        .routes(routes!(accept_invite))
+}
+
+pub fn public_router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(login))
+        .routes(routes!(verify_invite))
+        .routes(routes!(complete_registration))
+        .routes(routes!(refresh))
+        .routes(routes!(logout))
+        .routes(routes!(forgot_password))
+        .routes(routes!(reset_password))
+        .routes(routes!(instance_info))
+}
+
+#[utoipa::path(post, path = "/auth/login", tag = "auth", request_body = LoginRequest, responses((status = 200, body = AuthSession)), security(()))]
+async fn login(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    Json(req): Json<LoginRequest>,
+) -> AppResult<(CookieJar, Json<AuthSession>)> {
+    let key = format!("rate_limit:login:{}", req.email.to_lowercase());
+    let window = state.config.login_attempts_window_secs;
+    check_rate_limit(&state, &key, state.config.login_attempts_per_email, window).await?;
+    if let Some(ip) = crate::net::client_ip(&headers, peer, &state.config.trusted_proxies) {
+        check_rate_limit(
+            &state,
+            &format!("rate_limit:login_ip:{ip}"),
+            state.config.login_attempts_per_ip,
+            window,
+        )
+        .await?;
+    }
+
+    let user = state
+        .auth_service
+        .verify_password_only(&req.email, &req.password)
+        .await?;
+
+    // The password is only the first half now. Tokens are minted after the
+    // second factor, never before — a step-up that hands out a session first has
+    // not stepped anything up.
+    let enrolment = state.totp_repo.find(user.id).await?;
+    let requires_totp = enrolment.as_ref().is_some_and(|e| e.is_active());
+
+    if state.config.require_admin_totp && user.is_instance_admin && !requires_totp {
+        return Err(AppError::Forbidden(
+            "This instance requires admins to enrol a second factor before signing in".into(),
+        ));
+    }
+
+    if requires_totp {
+        let Some(code) = req.totp_code.as_deref().filter(|c| !c.is_empty()) else {
+            // A distinct answer on purpose: the password was right, and the
+            // client needs to know to ask for the code rather than for it again.
+            return Err(AppError::Conflict("totp_required".into()));
+        };
+
+        let enrolment = enrolment.expect("checked above");
+        let secret = crate::auth::totp::decrypt_secret(
+            &state.config.jwt_secret,
+            &enrolment.secret_encrypted,
+            &enrolment.nonce,
+        )?;
+
+        let matched = crate::auth::totp::matching_step(
+            &secret,
+            &user.email,
+            &state.config.instance_name,
+            code,
+            chrono::Utc::now().timestamp(),
+        )?;
+
+        let accepted = if let Some(step) = matched {
+            // A correct code is only accepted once: claiming the step the code
+            // came from stops the same six digits working again, whether the
+            // replay lands in that step or the next one.
+            state.totp_repo.claim_step(user.id, step).await?
+        } else {
+            consume_recovery_code(&state, user.id, code).await?
+        };
+
+        if !accepted {
+            audit::record(
+                &state,
+                AuditEntry::new(AuditAction::TotpFailed, user.id)
+                    .resource(user.id)
+                    .details(serde_json::json!({ "stage": "login" })),
+            )
+            .await;
+            return Err(AppError::Unauthorized("That code did not match".into()));
+        }
+    }
+
+    let tokens = state.auth_service.tokens_for(&user).await?;
+    let secure = state.config.public_url.starts_with("https://");
+    let jar = set_auth_cookies(jar, &tokens, secure);
+
+    Ok((jar, Json(tokens.into())))
+}
+
+/// A recovery code stands in for the authenticator exactly once.
+async fn consume_recovery_code(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    candidate: &str,
+) -> AppResult<bool> {
+    for (id, hash) in state.totp_repo.unused_recovery_hashes(user_id).await? {
+        if crate::auth::service::AuthService::verify_password(candidate, &hash).unwrap_or(false)
+            && state.totp_repo.consume_recovery_code(id).await?
+        {
+            audit::record(
+                state,
+                AuditEntry::new(AuditAction::TotpRecoveryUsed, user_id).resource(user_id),
+            )
+            .await;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[utoipa::path(get, path = "/auth/invites/{token}/verify", tag = "auth", responses((status = 200, body = InvitePreview)), security(()))]
+async fn verify_invite(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+) -> AppResult<Json<InvitePreview>> {
+    let claims = state.auth_service.verify_registration_token(&token)?;
+
+    let invalid = || AppError::Unauthorized("Invalid or expired invite".into());
+
+    let user = state
+        .auth_service
+        .repo()
+        .find_by_id(claims.sub)
+        .await?
+        .ok_or_else(invalid)?;
+
+    let workspace_id = claims.workspace_id.ok_or_else(invalid)?;
+
+    let workspace = state
+        .workspace_service
+        .repo
+        .find_workspace_by_id(workspace_id)
+        .await?
+        .ok_or_else(invalid)?;
+
+    Ok(Json(InvitePreview {
+        already_registered: user.status == UserStatus::Active,
+        email: user.email,
+        workspace_name: workspace.name,
+        workspace_id,
+    }))
+}
+
+/// An invite pointed at an account that already exists is a join, not a
+/// registration: the holder of the link is signed in already, so all that is
+/// left is the membership the invite promised.
+#[utoipa::path(
+    operation_id = "auth_accept_invite",
+    post, path = "/auth/invites/{token}/accept", tag = "auth", responses((status = 200, body = InviteAccepted)))]
+async fn accept_invite(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(token): Path<String>,
+) -> AppResult<Json<InviteAccepted>> {
+    let claims = state.auth_service.verify_registration_token(&token)?;
+
+    let workspace_id = claims
+        .workspace_id
+        .ok_or_else(|| AppError::BadRequest("Invite is not bound to a workspace".into()))?;
+
+    if claims.sub != auth.user_id {
+        return Err(AppError::Forbidden(
+            "This invite was issued to a different address".into(),
+        ));
+    }
+
+    let workspace = state
+        .workspace_service
+        .repo
+        .find_workspace_by_id(workspace_id)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Invalid or expired invite".into()))?;
+
+    let role: WorkspaceRole = claims
+        .invite_role
+        .as_deref()
+        .and_then(|r| serde_json::from_value(serde_json::Value::String(r.to_string())).ok())
+        .unwrap_or(WorkspaceRole::Member);
+
+    state
+        .workspace_service
+        .join_workspace(workspace_id, auth.user_id, &role)
+        .await?;
+
+    audit::record(
+        &state,
+        AuditEntry::new(AuditAction::InviteAccepted, auth.user_id)
+            .workspace(workspace_id)
+            .resource(workspace_id),
+    )
+    .await;
+
+    Ok(Json(InviteAccepted {
+        workspace_id,
+        workspace_name: workspace.name,
+    }))
+}
+
+#[utoipa::path(post, path = "/auth/complete-registration", tag = "auth", request_body = RegisterCompleteRequest, responses((status = 200, body = AuthSession)), security(()))]
+async fn complete_registration(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Json(req): Json<RegisterCompleteRequest>,
+) -> AppResult<(CookieJar, Json<AuthSession>)> {
+    let claims = state.auth_service.verify_registration_token(&req.token)?;
+
+    let tokens = state
+        .auth_service
+        .complete_registration(claims.sub, &req.password, &req.display_name)
+        .await?;
+
+    if let Some(workspace_id) = claims.workspace_id {
+        let role: WorkspaceRole = claims
+            .invite_role
+            .as_deref()
+            .and_then(|r| serde_json::from_value(serde_json::Value::String(r.to_string())).ok())
+            .unwrap_or(WorkspaceRole::Member);
+
+        state
+            .workspace_service
+            .join_workspace(workspace_id, claims.sub, &role)
+            .await?;
+    }
+
+    let secure = state.config.public_url.starts_with("https://");
+    let jar = set_auth_cookies(jar, &tokens, secure);
+
+    Ok((jar, Json(tokens.into())))
+}
+
+#[utoipa::path(post, path = "/auth/refresh", tag = "auth", responses((status = 200, body = AuthSession)), security(()))]
+async fn refresh(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> AppResult<(CookieJar, Json<AuthSession>)> {
+    let refresh_token = jar
+        .get("refresh_token")
+        .map(|c| c.value().to_string())
+        .or_else(|| bearer_token(&headers))
+        .ok_or_else(|| AppError::Unauthorized("No refresh token".into()))?;
+
+    let tokens = state
+        .auth_service
+        .refresh_access_token(&refresh_token)
+        .await?;
+    let secure = state.config.public_url.starts_with("https://");
+    let jar = set_auth_cookies(jar, &tokens, secure);
+
+    Ok((jar, Json(tokens.into())))
+}
+
+#[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 200, body = StatusResponse)), security(()))]
+async fn logout(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+) -> AppResult<(CookieJar, Json<StatusResponse>)> {
+    if let Some(cookie) = jar.get("refresh_token") {
+        let _ = state.auth_service.logout(cookie.value()).await;
+    }
+    let jar = clear_auth_cookies(jar);
+    Ok((jar, Json(StatusResponse::new("logged_out"))))
+}
+
+#[utoipa::path(post, path = "/auth/forgot-password", tag = "auth", request_body = ForgotPasswordRequest, responses((status = 200, body = StatusResponse)), security(()))]
+async fn forgot_password(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ForgotPasswordRequest>,
+) -> AppResult<Json<StatusResponse>> {
+    let key = format!("rate_limit:forgot:{}", req.email.to_lowercase());
+    check_rate_limit(&state, &key, 5, 900).await?;
+    state.auth_service.forgot_password(&req.email).await?;
+    Ok(Json(StatusResponse::new("sent")))
+}
+
+#[utoipa::path(post, path = "/auth/reset-password", tag = "auth", request_body = ResetPasswordRequest, responses((status = 200, body = StatusResponse)), security(()))]
+async fn reset_password(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ResetPasswordRequest>,
+) -> AppResult<Json<StatusResponse>> {
+    let user_id = state
+        .auth_service
+        .reset_password(&req.token, &req.password)
+        .await?;
+
+    // A reset is how somebody recovers a compromised account. Leaving the
+    // attacker's still-unexpired access token alive would defeat the point.
+    crate::sessions::revoke(
+        &state,
+        user_id,
+        crate::sessions::SessionScope::All,
+        "password reset",
+    )
+    .await?;
+
+    Ok(Json(StatusResponse::new("reset")))
+}
+
+#[utoipa::path(get, path = "/instance/info", tag = "instance", responses((status = 200, body = InstanceInfo)), security(()))]
+async fn instance_info(State(state): State<Arc<AppState>>) -> Json<InstanceInfo> {
+    Json(InstanceInfo {
+        name: state.config.instance_name.clone(),
+        icon_url: state.config.instance_icon_url.clone(),
+        sso_enabled: super::oidc_routes::settings_from(&state.config).is_configured()
+            && super::oidc::Provisioning::parse(
+                &state.config.oidc_provisioning,
+                &state.config.oidc_allowed_domains,
+            )
+            .may_sign_in(),
+    })
+}
+
+#[utoipa::path(get, path = "/users/me", tag = "users", responses((status = 200, body = UserPublic)))]
+async fn get_me(State(state): State<Arc<AppState>>, auth: AuthUser) -> AppResult<Json<UserPublic>> {
+    let user = state
+        .auth_service
+        .repo()
+        .find_by_id(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+    Ok(Json(user.into()))
+}
+
+#[utoipa::path(patch, path = "/users/me", tag = "users", request_body = UpdateProfileRequest, responses((status = 200, body = UserPublic)))]
+async fn update_me(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Json(req): Json<UpdateProfileRequest>,
+) -> AppResult<Json<UserPublic>> {
+    req.validate()?;
+    let user = state
+        .auth_service
+        .repo()
+        .update_profile(
+            auth.user_id,
+            req.display_name.as_deref(),
+            req.avatar_url.as_deref(),
+            req.bio.as_deref(),
+            req.timezone.as_deref(),
+        )
+        .await?;
+    Ok(Json(user.into()))
+}
+
+#[utoipa::path(put, path = "/users/me/status", tag = "users", request_body = SetStatusRequest, responses((status = 200, body = UserPublic)))]
+async fn set_status(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Json(req): Json<SetStatusRequest>,
+) -> AppResult<Json<UserPublic>> {
+    req.validate()?;
+    let emoji = req
+        .emoji
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let text = req.text.as_deref().map(str::trim).filter(|t| !t.is_empty());
+
+    if emoji.is_none() && text.is_none() {
+        return Err(AppError::Validation(
+            "A status needs an emoji or some text".into(),
+        ));
+    }
+    if let Some(expires_at) = req.expires_at {
+        if expires_at <= Utc::now() {
+            return Err(AppError::Validation(
+                "A status cannot expire in the past".into(),
+            ));
+        }
+    }
+
+    let user = state
+        .auth_service
+        .repo()
+        .set_status(auth.user_id, emoji, text, req.expires_at)
+        .await?;
+    Ok(Json(user.into()))
+}
+
+#[utoipa::path(delete, path = "/users/me/status", tag = "users", responses((status = 200, body = UserPublic)))]
+async fn clear_status(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+) -> AppResult<Json<UserPublic>> {
+    let user = state
+        .auth_service
+        .repo()
+        .set_status(auth.user_id, None, None, None)
+        .await?;
+    Ok(Json(user.into()))
+}
+
+#[utoipa::path(patch, path = "/users/me/password", tag = "users", request_body = ChangePasswordRequest, responses((status = 200, body = StatusResponse)))]
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Json(req): Json<ChangePasswordRequest>,
+) -> AppResult<Json<StatusResponse>> {
+    state
+        .auth_service
+        .change_password(auth.user_id, &req.current_password, &req.new_password)
+        .await?;
+
+    // Every other device is signed out; the one doing the change is not, or
+    // people learn to avoid changing their password.
+    let scope = match auth.jti {
+        Some(jti) => crate::sessions::SessionScope::AllExcept(jti),
+        None => crate::sessions::SessionScope::All,
+    };
+    crate::sessions::revoke(&state, auth.user_id, scope, "password changed").await?;
+
+    Ok(Json(StatusResponse::new("password_changed")))
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(std::string::ToString::to_string)
+}
+
+pub(crate) fn set_auth_cookies(jar: CookieJar, tokens: &AuthTokens, secure: bool) -> CookieJar {
+    let access = Cookie::build(("access_token", tokens.access_token.clone()))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .secure(secure)
+        .max_age(time::Duration::seconds(tokens.expires_in))
+        .build();
+
+    let refresh = Cookie::build(("refresh_token", tokens.refresh_token.clone()))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/api/auth")
+        .secure(secure)
+        .max_age(time::Duration::days(7))
+        .build();
+
+    jar.add(access).add(refresh)
+}
+
+fn clear_auth_cookies(jar: CookieJar) -> CookieJar {
+    let access = Cookie::build(("access_token", ""))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(time::Duration::seconds(0))
+        .build();
+
+    let refresh = Cookie::build(("refresh_token", ""))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .path("/api/auth")
+        .max_age(time::Duration::seconds(0))
+        .build();
+
+    jar.add(access).add(refresh)
+}
+
+async fn check_rate_limit(
+    state: &AppState,
+    key: &str,
+    max_attempts: u64,
+    window_secs: u64,
+) -> AppResult<()> {
+    let mut conn = state.redis.clone();
+    // Fail closed: a Redis outage must not silently remove brute-force
+    // protection from the one endpoint that guards passwords.
+    crate::rate_limit::enforce(
+        &mut conn,
+        key,
+        max_attempts,
+        window_secs,
+        crate::rate_limit::LimiterFailure::Closed,
+    )
+    .await
+}

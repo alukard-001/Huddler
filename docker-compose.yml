@@ -1,0 +1,361 @@
+# =============================================================================
+# Huddler — Docker Compose (base)
+# =============================================================================
+# SECRETS: this file reads required secrets from the environment / a .env file.
+# Before running, copy the template and fill in strong values:
+#   cp .env.example .env
+#   # then set JWT_SECRET, ADMIN_PASSWORD, POSTGRES_PASSWORD, etc.
+# Docker Compose auto-loads a .env file in this directory. The `${VAR:?msg}`
+# syntax below fails fast with a clear error if a required var is missing.
+# =============================================================================
+# Usage:
+#   docker compose up -d --build                       — infra + api + realtime
+#   docker compose --profile frontend up -d --build    — also the dockerized SPA
+#                                                         (app at http://localhost:8080)
+#   docker compose --profile s3 up -d                  — also MinIO object storage
+#   docker compose down                                — stop all services
+#   docker compose down -v                             — stop and wipe all data
+#
+# Local backend dev (run api/realtime/SPA on the host instead):
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# PRODUCTION (TLS, restart policies, resource limits, no raw ports):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --profile frontend --profile s3 up -d --build
+#   # serves https://$DOMAIN via Caddy (auto Let's Encrypt). See README.
+# =============================================================================
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: huddler
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat -d huddler"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Loopback-only: reachable for host-run dev binaries, never exposed remotely.
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "127.0.0.1:6380:6379"
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    profiles: ["s3"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set for the s3 profile (see .env.example)}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-08T15-39-49Z
+    profiles: ["s3"]
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set for the s3 profile (see .env.example)}
+      BUCKET_NAME: ${S3_BUCKET:-huddler}
+    entrypoint: /bin/sh
+    command: /init.sh
+    volumes:
+      - ./docker/minio-init.sh:/init.sh:ro
+    restart: "no"
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    platform: linux/amd64
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+  # A real OIDC provider for dev and the E2E suite: the redirect, the cookie and
+  # the code exchange are exactly where SSO integrations break, and none of that
+  # is exercised by stubbing the token endpoint in-process.
+  oidc:
+    image: ghcr.io/navikt/mock-oauth2-server:2.1.10
+    restart: unless-stopped
+    environment:
+      # Issued URLs have to be reachable under the same name from the browser
+      # and from the API container, so the host port is mapped straight through.
+      SERVER_PORT: "8090"
+      # `code` is a parameter of the token request; `scope` is not, so a mapping
+      # keyed on it never matches and the id token comes back without a subject.
+      JSON_CONFIG: >-
+        {
+          "interactiveLogin": false,
+          "tokenCallbacks": [
+            {
+              "issuerId": "chat",
+              "tokenExpiry": 3600,
+              "requestMappings": [
+                {
+                  "requestParam": "code",
+                  "match": "*",
+                  "claims": {
+                    "sub": "sso-user-1",
+                    "aud": ["huddler"],
+                    "email": "sso@dev.local",
+                    "email_verified": true,
+                    "name": "SSO User"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+    # The same host name has to work from inside the compose network and from the
+    # browser, or the issuer in the discovery document will not match the one
+    # configured and the client rejects the token. Chromium is pointed at this
+    # port with --host-resolver-rules in the SSO spec.
+    ports:
+      - "127.0.0.1:8090:8090"
+
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    profiles: ["turn"]
+    restart: unless-stopped
+    # TURN allocates a wide UDP relay-port range and the browser must reach those
+    # ports directly, so the container shares the host network namespace. This
+    # works on Linux hosts (production); on Docker Desktop (mac/Windows) host
+    # networking is limited — for local dev, STUN-only (the API default) is enough.
+    network_mode: "host"
+    volumes:
+      - ./docker/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # TURN_SECRET must be set when running this profile (see .env.example); it is
+    # given a soft default here only so the base compose still interpolates when
+    # the `turn` profile is NOT selected (Compose evaluates the whole file).
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --static-auth-secret=${TURN_SECRET:-}
+      - --realm=${TURN_REALM:-huddler.local}
+
+  # ── Backend Services ─────────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: chat-api:${VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      SERVICE: chat-api
+      PORT: "3000"
+      DATABASE_URL: postgres://chat:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}@postgres:5432/huddler
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (see .env.example)}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_PROVISIONING: ${OIDC_PROVISIONING:-invite_only}
+      OIDC_ALLOWED_DOMAINS: ${OIDC_ALLOWED_DOMAINS:-}
+      REQUIRE_ADMIN_TOTP: ${REQUIRE_ADMIN_TOTP:-false}
+      WEBHOOK_ALLOW_PRIVATE_TARGETS: ${WEBHOOK_ALLOW_PRIVATE_TARGETS:-false}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@localhost}
+      RETENTION_DRY_RUN: ${RETENTION_DRY_RUN:-false}
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      SMTP_FROM_ADDRESS: noreply@dev.local
+      SMTP_FROM_NAME: Huddler
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@dev.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set (see .env.example)}
+      INSTANCE_NAME: ${INSTANCE_NAME:-Huddler}
+      # PUBLIC_URL is used for invite/reset email links AND decides whether auth
+      # cookies are marked Secure (https → Secure). In production set this to your
+      # public https domain (the prod override does this from $DOMAIN).
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3001}
+      # Login throttling. Raise the IP budget when many users share one egress IP
+      # (corporate NAT/VPN) or when an E2E suite logs in repeatedly from one host.
+      LOGIN_ATTEMPTS_PER_EMAIL: ${LOGIN_ATTEMPTS_PER_EMAIL:-10}
+      LOGIN_ATTEMPTS_PER_IP: ${LOGIN_ATTEMPTS_PER_IP:-30}
+      LOGIN_ATTEMPTS_WINDOW_SECS: ${LOGIN_ATTEMPTS_WINDOW_SECS:-900}
+      WRITE_RATE_LIMIT_MULTIPLIER: ${WRITE_RATE_LIMIT_MULTIPLIER:-1}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      LOCAL_STORAGE_PATH: /data/files
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-huddler}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # Huddle WebRTC ICE servers. TURN_* are optional — when unset the API hands
+      # out STUN-only (fine for LAN/non-symmetric NAT). Set them (and run the
+      # `turn` profile) to relay through the coturn service above; TURN_SECRET
+      # must match coturn's --static-auth-secret.
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_URLS: ${TURN_URLS:-}
+      STUN_URLS: ${STUN_URLS:-stun:stun.l.google.com:19302}
+      TURN_TTL_SECS: ${TURN_TTL_SECS:-43200}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - file_data:/data/files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Loopback-only host port so a host-run Vite dev server (npm run dev) can proxy
+    # /api here. In full-docker mode the SPA reaches it via nginx instead.
+    ports:
+      - "127.0.0.1:3000:3000"
+    # /readyz checks DB + Redis (unlike the image's /livez), so a wedged process
+    # is marked unhealthy and the prod autoheal sidecar can restart it.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      autoheal: "true"
+
+  # Background consumers (outgoing webhooks, reminders, notifications, huddle
+  # history, call ringing, scheduled messages). They run here and not in `api`,
+  # so an API replica never carries a side effect. Every consumer reads through
+  # a Redis Streams consumer group or claims its row first, so this scales like
+  # `api` does; production runs two.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: chat-worker:${VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      SERVICE: chat-worker
+      PORT: "3005"
+      DATABASE_URL: postgres://chat:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}@postgres:5432/huddler
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (see .env.example)}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      # The worker is what sends the pushes, so it needs the pair too.
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@localhost}
+      # Queued email (invites, resets, mention digests) is delivered from here,
+      # not from the api, so the SMTP settings have to match the api's.
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      SMTP_FROM_ADDRESS: noreply@dev.local
+      SMTP_FROM_NAME: Huddler
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      LOCAL_STORAGE_PATH: /data/files
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-huddler}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - file_data:/data/files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # chat-api owns the migrations; wait for it so consumers never query a
+      # schema that has not been applied yet.
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3005/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      autoheal: "true"
+
+  realtime:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: chat-realtime:${VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      SERVICE: chat-realtime
+      PORT: "3004"
+      DATABASE_URL: postgres://chat:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}@postgres:5432/huddler
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (see .env.example)}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3001}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Loopback-only host port so a host-run Vite dev server can proxy /ws here.
+    # In full-docker mode the SPA reaches it via nginx instead.
+    ports:
+      - "127.0.0.1:3004:3004"
+    # /readyz checks DB + Redis + that the event consumer is not stalled.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3004/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      autoheal: "true"
+
+  # ── Frontend (React → nginx) ──────────────────────────────────────────────
+
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: chat-frontend:${VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      - api
+      - realtime
+    # nginx serves the SPA and proxies /api + /ws internally.
+    # Loopback-only host port for local full-docker demos: http://localhost:8080
+    # In production, Caddy fronts this service on 443 over the docker network.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  file_data:

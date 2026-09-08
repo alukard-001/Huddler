@@ -1,0 +1,216 @@
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::Json;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use shared_common::errors::{AppError, AppResult};
+
+use super::service::AuthService;
+use super::totp;
+use crate::audit::{self, AuditAction, AuditEntry, ClientIp};
+use crate::dto::StatusResponse;
+use crate::middleware::AuthUser;
+use crate::state::AppState;
+
+pub fn router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(status))
+        .routes(routes!(enrol))
+        .routes(routes!(confirm))
+        .routes(routes!(disable))
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TotpStatus {
+    pub enrolled: bool,
+    pub recovery_codes_remaining: i64,
+    pub required: bool,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TotpEnrolment {
+    pub secret: String,
+    pub provisioning_uri: String,
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct TotpConfirmed {
+    pub status: &'static str,
+    pub recovery_codes: Vec<String>,
+}
+
+#[utoipa::path(get, path = "/auth/totp", tag = "totp", responses((status = 200, body = TotpStatus)))]
+async fn status(State(state): State<Arc<AppState>>, auth: AuthUser) -> AppResult<Json<TotpStatus>> {
+    let enrolment = state.totp_repo.find(auth.user_id).await?;
+    let remaining = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM totp_recovery_codes WHERE user_id = $1 AND used_at IS NULL"#,
+        auth.user_id
+    )
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(TotpStatus {
+        enrolled: enrolment.map(|e| e.is_active()).unwrap_or(false),
+        recovery_codes_remaining: remaining,
+        required: state.config.require_admin_totp,
+    }))
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct CodeRequest {
+    pub code: String,
+}
+
+/// Hands back a secret and its provisioning URI. Nothing is enforced yet: the
+/// enrolment is not active until a code proves the authenticator actually has
+/// it, or people lock themselves out of accounts they never finished setting up.
+#[utoipa::path(post, path = "/auth/totp/enrol", tag = "totp", responses((status = 200, body = TotpEnrolment)))]
+async fn enrol(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+) -> AppResult<Json<TotpEnrolment>> {
+    let user = state
+        .auth_service
+        .repo()
+        .find_by_id(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+
+    let secret = totp::generate_secret();
+    let (ciphertext, nonce) = totp::encrypt_secret(&state.config.jwt_secret, &secret)?;
+    state
+        .totp_repo
+        .start_enrolment(auth.user_id, &ciphertext, &nonce)
+        .await?;
+
+    let uri = totp::provisioning_uri(&secret, &user.email, &state.config.instance_name)?;
+    Ok(Json(TotpEnrolment {
+        secret,
+        provisioning_uri: uri,
+    }))
+}
+
+#[utoipa::path(post, path = "/auth/totp/confirm", tag = "totp", request_body = CodeRequest, responses((status = 200, body = TotpConfirmed)))]
+async fn confirm(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    ip: ClientIp,
+    Json(req): Json<CodeRequest>,
+) -> AppResult<Json<TotpConfirmed>> {
+    let user = state
+        .auth_service
+        .repo()
+        .find_by_id(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+    let enrolment = state
+        .totp_repo
+        .find(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Start an enrolment first".into()))?;
+
+    let secret = totp::decrypt_secret(
+        &state.config.jwt_secret,
+        &enrolment.secret_encrypted,
+        &enrolment.nonce,
+    )?;
+    let Some(step) = totp::matching_step(
+        &secret,
+        &user.email,
+        &state.config.instance_name,
+        &req.code,
+        chrono::Utc::now().timestamp(),
+    )?
+    else {
+        audit::record(
+            &state,
+            AuditEntry::new(AuditAction::TotpFailed, auth.user_id)
+                .resource(auth.user_id)
+                .ip(&ip)
+                .details(serde_json::json!({ "stage": "enrolment" })),
+        )
+        .await;
+        return Err(AppError::Unauthorized("That code did not match".into()));
+    };
+
+    state.totp_repo.confirm(auth.user_id, step).await?;
+
+    // Shown once. They are the way back in when the phone is gone, so they are
+    // hashed exactly like a password and never retrievable afterwards.
+    let codes = totp::generate_recovery_codes();
+    let hashes: Vec<String> = codes
+        .iter()
+        .filter_map(|c| AuthService::hash_password(c).ok())
+        .collect();
+    state
+        .totp_repo
+        .replace_recovery_codes(auth.user_id, &hashes)
+        .await?;
+
+    audit::record(
+        &state,
+        AuditEntry::new(AuditAction::TotpEnrolled, auth.user_id)
+            .resource(auth.user_id)
+            .ip(&ip),
+    )
+    .await;
+
+    Ok(Json(TotpConfirmed {
+        status: "enrolled",
+        recovery_codes: codes,
+    }))
+}
+
+#[utoipa::path(post, path = "/auth/totp/disable", tag = "totp", request_body = CodeRequest, responses((status = 200, body = StatusResponse)))]
+async fn disable(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    ip: ClientIp,
+    Json(req): Json<CodeRequest>,
+) -> AppResult<Json<StatusResponse>> {
+    let user = state
+        .auth_service
+        .repo()
+        .find_by_id(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+
+    // An instance admin cannot take their own second factor off while the
+    // instance requires one: that would be a supported way back to the weaker
+    // account the requirement exists to prevent.
+    if state.config.require_admin_totp && user.is_instance_admin {
+        return Err(AppError::Forbidden(
+            "This instance requires a second factor for admins".into(),
+        ));
+    }
+
+    let enrolment = state
+        .totp_repo
+        .find(auth.user_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("No second factor is enrolled".into()))?;
+    let secret = totp::decrypt_secret(
+        &state.config.jwt_secret,
+        &enrolment.secret_encrypted,
+        &enrolment.nonce,
+    )?;
+
+    // Proving possession before removal: an attacker with a live session should
+    // not be able to strip the factor that would have stopped them.
+    if !totp::verify(&secret, &user.email, &state.config.instance_name, &req.code)? {
+        return Err(AppError::Unauthorized("That code did not match".into()));
+    }
+
+    state.totp_repo.disable(auth.user_id).await?;
+    audit::record(
+        &state,
+        AuditEntry::new(AuditAction::TotpDisabled, auth.user_id)
+            .resource(auth.user_id)
+            .ip(&ip),
+    )
+    .await;
+
+    Ok(Json(StatusResponse::new("disabled")))
+}

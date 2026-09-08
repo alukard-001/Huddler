@@ -1,0 +1,430 @@
+use crate::connection_manager::Audience;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use super::common::*;
+
+fn inbound() -> crate::ws_handler::InboundState {
+    crate::ws_handler::InboundState::new()
+}
+
+async fn await_typing_for_channel(channel_id: Uuid) -> Option<serde_json::Value> {
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let client = redis::Client::open(url).expect("redis client");
+    let mut pubsub = client.get_async_pubsub().await.expect("pubsub");
+    pubsub.subscribe("events:typing").await.expect("subscribe");
+    let mut stream = pubsub.into_on_message();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let msg = match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(m)) => m,
+            _ => return None,
+        };
+        let payload: String = match msg.get_payload() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let env: serde_json::Value = match serde_json::from_str(&payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let matches = env
+            .get("payload")
+            .and_then(|p| p.get("channel_id"))
+            .and_then(|v| v.as_str())
+            == Some(&channel_id.to_string());
+        if matches {
+            return Some(env);
+        }
+    }
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn subscribe_member_workspace_sends_presence_batch(pool: PgPool) {
+    let cm = manager(pool).await;
+    let user = seed_user(cm.db()).await;
+    let ws = seed_workspace(cm.db(), user).await;
+    add_ws_member(cm.db(), ws, user).await;
+
+    cm.presence_set_online(user, &[ws]).await;
+
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    let text = serde_json::json!({ "type": "subscribe", "workspace_id": ws }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+
+    let frames = drain_json(&mut rx);
+    let batch = frames
+        .iter()
+        .find(|f| f.get("type").and_then(|v| v.as_str()) == Some("presence.batch"))
+        .expect("conn should receive presence.batch after subscribe");
+
+    let users = batch
+        .get("users")
+        .and_then(|v| v.as_array())
+        .expect("presence.batch has users array");
+    let contains_user = users.iter().any(|u| {
+        u.get("user_id").and_then(|v| v.as_str()) == Some(&user.to_string())
+            && u.get("status").and_then(|v| v.as_str()) == Some("online")
+    });
+    assert!(
+        contains_user,
+        "presence.batch should list the online member, got: {users:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn subscribe_non_member_workspace_denied(pool: PgPool) {
+    let cm = manager(pool).await;
+    let owner = seed_user(cm.db()).await;
+    let ws = seed_workspace(cm.db(), owner).await;
+    let outsider = seed_user(cm.db()).await;
+
+    let (conn_id, mut rx) = fake_conn(&cm, outsider);
+
+    let text = serde_json::json!({ "type": "subscribe", "workspace_id": ws }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, outsider, &cm, &mut inbound()).await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.get("type").and_then(|v| v.as_str()) == Some("presence.batch")),
+        "non-member subscribe must NOT receive presence.batch, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn subscribe_member_then_workspace_broadcast_reaches_conn(pool: PgPool) {
+    let cm = manager(pool).await;
+    let user = seed_user(cm.db()).await;
+    let ws = seed_workspace(cm.db(), user).await;
+    add_ws_member(cm.db(), ws, user).await;
+
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    let text = serde_json::json!({ "type": "subscribe", "workspace_id": ws }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+    let _ = drain_json(&mut rx);
+
+    cm.broadcast_to_workspace(Audience::Everyone, ws, r#"{"type":"workspace.ping"}"#)
+        .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.get("type").and_then(|v| v.as_str()) == Some("workspace.ping")),
+        "subscribed conn should receive workspace broadcast, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn channel_join_member_then_broadcast_reaches_conn(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    let text = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+
+    cm.broadcast_to_channel(Audience::Everyone, ch, r#"{"type":"message.new"}"#)
+        .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.get("type").and_then(|v| v.as_str()) == Some("message.new")),
+        "joined member should receive channel broadcast, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn channel_join_non_member_denied_no_broadcast(pool: PgPool) {
+    let cm = manager(pool).await;
+    let creator = seed_user(cm.db()).await;
+    let ws = seed_workspace(cm.db(), creator).await;
+    add_ws_member(cm.db(), ws, creator).await;
+    let ch = seed_channel(cm.db(), ws, creator).await;
+    add_ch_member(cm.db(), ch, creator).await;
+
+    let outsider = seed_user(cm.db()).await;
+    let (conn_id, mut rx) = fake_conn(&cm, outsider);
+
+    let text = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, outsider, &cm, &mut inbound()).await;
+
+    cm.broadcast_to_channel(Audience::Everyone, ch, r#"{"type":"message.new"}"#)
+        .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames.is_empty(),
+        "denied (non-member) join must not subscribe; broadcast must not reach conn, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn channel_leave_stops_broadcasts(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    let join = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&join, &conn_id, user, &cm, &mut inbound()).await;
+
+    let leave = serde_json::json!({ "type": "channel.leave", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&leave, &conn_id, user, &cm, &mut inbound()).await;
+
+    cm.broadcast_to_channel(Audience::Everyone, ch, r#"{"type":"message.new"}"#)
+        .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames.is_empty(),
+        "after leave, channel broadcast must not reach conn, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn typing_start_member_publishes(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+    let (conn_id, _rx) = fake_conn(&cm, user);
+    let join = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&join, &conn_id, user, &cm, &mut inbound()).await;
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+
+    let text = serde_json::json!({ "type": "typing.start", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+
+    let env = listener
+        .await
+        .expect("listener task")
+        .expect("typing.start should publish a typing.indicator to events:typing");
+
+    assert_eq!(
+        env.get("event_type").and_then(|v| v.as_str()),
+        Some("typing.indicator")
+    );
+    let payload = env.get("payload").expect("envelope payload");
+    let user_str = user.to_string();
+    assert_eq!(
+        payload.get("user_id").and_then(|v| v.as_str()),
+        Some(user_str.as_str())
+    );
+    assert_eq!(
+        payload
+            .get("is_typing")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn typing_start_without_having_joined_is_denied(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+    let (conn_id, _rx) = fake_conn(&cm, user);
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+
+    let text = serde_json::json!({ "type": "typing.start", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+
+    let env = listener.await.expect("listener task");
+    assert!(
+        env.is_none(),
+        "a member who has not joined the channel on this socket has not proven anything yet, got: {env:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn typing_start_non_member_denied_no_publish(pool: PgPool) {
+    let cm = manager(pool).await;
+    let creator = seed_user(cm.db()).await;
+    let ws = seed_workspace(cm.db(), creator).await;
+    add_ws_member(cm.db(), ws, creator).await;
+    let ch = seed_channel(cm.db(), ws, creator).await;
+    add_ch_member(cm.db(), ch, creator).await;
+
+    let outsider = seed_user(cm.db()).await;
+    let (conn_id, _rx) = fake_conn(&cm, outsider);
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+
+    let text = serde_json::json!({ "type": "typing.start", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, outsider, &cm, &mut inbound()).await;
+
+    let env = listener.await.expect("listener task");
+    assert!(
+        env.is_none(),
+        "non-member typing.start must NOT publish, got: {env:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn typing_stop_member_publishes_false(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+    let (conn_id, _rx) = fake_conn(&cm, user);
+    let join = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&join, &conn_id, user, &cm, &mut inbound()).await;
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+
+    let text = serde_json::json!({ "type": "typing.stop", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut inbound()).await;
+
+    let env = listener
+        .await
+        .expect("listener task")
+        .expect("typing.stop should publish a typing.indicator");
+    assert_eq!(
+        env.get("payload")
+            .and_then(|p| p.get("is_typing"))
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn ping_replies_pong(pool: PgPool) {
+    let cm = manager(pool).await;
+    let user = seed_user(cm.db()).await;
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    crate::ws_handler::handle_client_message(
+        r#"{"type":"ping"}"#,
+        &conn_id,
+        user,
+        &cm,
+        &mut inbound(),
+    )
+    .await;
+
+    let frame = next_json(&mut rx).expect("ping should enqueue a frame");
+    assert_eq!(frame.get("type").and_then(|v| v.as_str()), Some("pong"));
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn invalid_json_is_ignored(pool: PgPool) {
+    let cm = manager(pool).await;
+    let user = seed_user(cm.db()).await;
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+
+    crate::ws_handler::handle_client_message("{not json", &conn_id, user, &cm, &mut inbound())
+        .await;
+    crate::ws_handler::handle_client_message(
+        r#"{"type":"totally.unknown"}"#,
+        &conn_id,
+        user,
+        &cm,
+        &mut inbound(),
+    )
+    .await;
+    crate::ws_handler::handle_client_message(
+        r#"{"foo":"bar"}"#,
+        &conn_id,
+        user,
+        &cm,
+        &mut inbound(),
+    )
+    .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames.is_empty(),
+        "malformed/unknown messages must enqueue nothing, got: {frames:?}"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn repeated_typing_for_the_same_channel_is_coalesced(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, _ws, ch) = seed_member_in_channel(cm.db()).await;
+    let (conn_id, _rx) = fake_conn(&cm, user);
+    let join = serde_json::json!({ "type": "channel.join", "channel_ids": [ch] }).to_string();
+    crate::ws_handler::handle_client_message(&join, &conn_id, user, &cm, &mut inbound()).await;
+    let mut state = inbound();
+
+    let text = serde_json::json!({ "type": "typing.start", "channel_id": ch }).to_string();
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut state).await;
+    listener
+        .await
+        .expect("listener task")
+        .expect("the first typing.start publishes");
+
+    // A client re-sends typing.start every few keystrokes. Republishing each one
+    // costs a membership lookup and a fan-out for no change in what anyone sees.
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut state).await;
+    assert!(
+        listener.await.expect("listener task").is_none(),
+        "a repeat inside the coalesce window must not reach Redis"
+    );
+
+    // Stopping clears the window, so the next start is a real signal again.
+    let stop = serde_json::json!({ "type": "typing.stop", "channel_id": ch }).to_string();
+    crate::ws_handler::handle_client_message(&stop, &conn_id, user, &cm, &mut state).await;
+
+    let listener = tokio::spawn(await_typing_for_channel(ch));
+    settle().await;
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut state).await;
+    assert!(
+        listener.await.expect("listener task").is_some(),
+        "typing again after a stop publishes"
+    );
+}
+
+#[test_macros::db_test(migrations = "../migrations")]
+async fn a_workspace_full_of_channels_joins_in_one_frame(pool: PgPool) {
+    let cm = manager(pool).await;
+    let (user, ws, first) = seed_member_in_channel(cm.db()).await;
+
+    // Comfortably past the inbound burst the gateway allows. Sent as one frame
+    // per channel, this is the shape that used to close the socket at connect.
+    let mut ids = vec![first.to_string()];
+    for _ in 0..120 {
+        let ch = seed_channel(cm.db(), ws, user).await;
+        add_ch_member(cm.db(), ch, user).await;
+        ids.push(ch.to_string());
+    }
+    let last: Uuid = ids.last().expect("a channel").parse().expect("uuid");
+
+    let (conn_id, mut rx) = fake_conn(&cm, user);
+    let text = serde_json::json!({ "type": "channel.join", "channel_ids": ids }).to_string();
+    let mut limiter = inbound();
+    crate::ws_handler::handle_client_message(&text, &conn_id, user, &cm, &mut limiter).await;
+
+    cm.broadcast_to_channel(Audience::Everyone, last, r#"{"type":"message.new"}"#)
+        .await;
+
+    let frames = drain_json(&mut rx);
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.get("type").and_then(|v| v.as_str()) == Some("message.new")),
+        "the last channel in the batch is joined too, got: {frames:?}"
+    );
+}

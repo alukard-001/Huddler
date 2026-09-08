@@ -1,0 +1,127 @@
+[package]
+name = "chat-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate is a library so both binaries can share it: chat-api serves HTTP,
+# chat-worker runs the Redis consumers and scheduled dispatchers. Running the
+# consumers inside every API replica duplicates every side effect they produce.
+[lib]
+name = "chat_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chat-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "chat-worker"
+path = "src/bin/chat-worker.rs"
+
+[[bin]]
+name = "chat-import"
+path = "src/bin/chat-import.rs"
+
+[[bin]]
+name = "chat-openapi"
+path = "src/bin/chat-openapi.rs"
+
+[[bin]]
+name = "chat-ts-events"
+path = "src/bin/chat-ts-events.rs"
+
+[dependencies]
+shared-common = { path = "../shared/common" }
+shared-events = { path = "../shared/events" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+totp-rs = { workspace = true }
+
+# Redis
+redis = { workspace = true }
+
+# File storage (local disk, S3 / MinIO)
+object_store = { workspace = true }
+
+# Auth
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+
+# Async traits (FileStorage)
+async-trait = { workspace = true }
+
+# Crypto (webhook signing + TURN REST credentials)
+hmac = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+openidconnect = { workspace = true }
+base64 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+garde = { workspace = true }
+askama = { workspace = true }
+ipnet = { workspace = true }
+backon = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+time = { workspace = true }
+rand = { workspace = true }
+mime_guess = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+# Email
+lettre = { workspace = true }
+
+# HTTP client (for outgoing webhooks)
+reqwest = { workspace = true }
+zip = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Async streams (for Redis consumers)
+futures-util = { workspace = true }
+
+# Environment variables
+dotenvy = "0.15"
+web-push = { workspace = true }
+
+[dev-dependencies]
+# `#[tokio::test]` (macros) + a real runtime for async tests.
+tokio = { workspace = true }
+# `#[db_test]` clones a migrated template into a database per test.
+sqlx = { workspace = true }
+test-macros = { path = "../test-macros" }
+shared-common = { path = "../shared/common", features = ["testing"] }
+# Decoding/asserting JWT claims directly in tests.
+jsonwebtoken = { workspace = true }
+uuid = { workspace = true }
+# `ServiceExt::oneshot` for driving the router in HTTP integration tests.
+tower = { workspace = true, features = ["util"] }

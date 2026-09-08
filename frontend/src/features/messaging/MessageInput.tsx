@@ -1,0 +1,468 @@
+import { useRef, useCallback, useMemo, useEffect, useState } from 'react';
+import { toUserMessage } from '@/lib/errors';
+import { formatDateTime } from '@/lib/datetime';
+import { Extension } from '@tiptap/core';
+import { useEditor, EditorContent } from '@tiptap/react';
+import Placeholder from '@tiptap/extension-placeholder';
+import Mention from '@tiptap/extension-mention';
+import { createEditorExtensions } from '@/lib/tiptapExtensions';
+import { createMentionSuggestion, mentionSuggestionPluginKey } from './mentionSuggestion';
+import { emojiSuggestionPluginKey } from './emojiSuggestion';
+import type { MentionItem } from './MentionDropdown';
+import EmojiPicker from './EmojiPicker';
+import FormattingToolbar from '@/components/FormattingToolbar';
+import type { WorkspaceMember, Channel } from '@/stores/workspace';
+import { Clock, Paperclip, Send, SmilePlus, Type } from 'lucide-react';
+import { MENTION_SUGGESTION_LIMIT, DRAFT_SAVE_DEBOUNCE_MS } from '@/shared/constants';
+import { uploadFilesSequentially, transferFiles } from '@/lib/fileUploads';
+import { useDraftStore } from '@/stores/drafts';
+import { flattenMentions } from '@/lib/mentions';
+import { useScheduleMessage, type ScheduleTarget } from '@/hooks/queries/useScheduledMessages';
+import { toast } from '@/shared/components/Toast';
+import { SCHEDULE_PRESETS, formatScheduleHint, toLocalInputValue } from './schedulePresets';
+import { useOnClickOutside } from '@/shared/hooks/useOnClickOutside';
+import { useEscapeToClose } from '@/shared/hooks/useEscapeToClose';
+import { buildMentionItems } from './mentionItems';
+import { useUserGroups } from '@/hooks/queries/useUserGroups';
+import { useWorkspaceStore } from '@/stores/workspace';
+
+const MentionNode = Mention.extend({
+  addStorage() {
+    return {
+      markdown: {
+        serialize(state: { write: (s: string) => void }, node: { attrs: { label?: string; id: string } }) {
+          const label = node.attrs.label ?? node.attrs.id;
+          state.write(`@[${label}](${node.attrs.id})`);
+        },
+        parse: {},
+      },
+    };
+  },
+});
+
+interface Props {
+  channelName?: string;
+  members?: WorkspaceMember[];
+  channels?: Channel[];
+  isDm?: boolean;
+  placeholder?: string;
+  draftKey?: string;
+  initialContent?: string;
+  editing?: boolean;
+  onSend: (content: string) => Promise<void>;
+  onCancel?: () => void;
+  onFileUpload?: (file: File) => Promise<void>;
+  onTyping?: () => void;
+  uploading?: boolean;
+  workspaceId?: string;
+  instanceUrl?: string;
+  scheduleTarget?: ScheduleTarget;
+}
+
+export default function MessageInput({
+  channelName = '',
+  members = [],
+  channels = [],
+  isDm = false,
+  placeholder,
+  draftKey,
+  initialContent,
+  editing = false,
+  onSend,
+  onCancel,
+  onFileUpload,
+  onTyping,
+  uploading = false,
+  workspaceId,
+  instanceUrl,
+  scheduleTarget,
+}: Props) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadRef = useRef(onFileUpload);
+  useEffect(() => {
+    uploadRef.current = onFileUpload;
+  });
+
+  const uploadFiles = useCallback(async (files: File[]) => {
+    const upload = uploadRef.current;
+    if (!upload) return;
+    await uploadFilesSequentially(files, upload);
+  }, []);
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sendRef = useRef<() => void>(() => {});
+  const emojiBtnRef = useRef<HTMLButtonElement>(null);
+  const [showEmoji, setShowEmoji] = useState(false);
+  const [showFormatting, setShowFormatting] = useState(false);
+  const editingRef = useRef(editing);
+  const cancelRef = useRef(onCancel);
+  useEffect(() => {
+    editingRef.current = editing;
+    cancelRef.current = onCancel;
+  });
+
+  const workspace = useWorkspaceStore((s) => s.currentWorkspace);
+  const { data: groups } = useUserGroups(workspace?.id, workspace?.instanceUrl);
+  const mentionItems = useMemo<MentionItem[]>(
+    () => buildMentionItems(members, channels, isDm, groups ?? []),
+    [members, channels, isDm, groups],
+  );
+  // The editor is built once, but the people it can mention change with the
+  // channel, so the suggestion callback reads the current list through a ref.
+  // The compiler cannot see that tiptap only calls this while somebody types.
+  const mentionItemsRef = useRef<MentionItem[]>(mentionItems);
+  useEffect(() => {
+    mentionItemsRef.current = mentionItems;
+  }, [mentionItems]);
+
+  const mentionExtension = useMemo(
+    () =>
+      MentionNode.configure({
+        HTMLAttributes: { class: 'mention' },
+        suggestion: createMentionSuggestion((query) => {
+          const q = query.toLowerCase();
+          return mentionItemsRef.current
+            .filter((item) => item.label.toLowerCase().includes(q))
+            .slice(0, MENTION_SUGGESTION_LIMIT);
+        }),
+      }),
+    [],
+  );
+
+  const submitExtension = useMemo(
+    () =>
+      Extension.create({
+        name: 'submitOnEnter',
+        priority: 1000,
+        addKeyboardShortcuts() {
+          return {
+            Enter: () => {
+              const mention = mentionSuggestionPluginKey.getState(this.editor.state) as
+                { active?: boolean } | undefined;
+              const emoji = emojiSuggestionPluginKey.getState(this.editor.state) as
+                { active?: boolean } | undefined;
+              if (mention?.active || emoji?.active) return false;
+              sendRef.current();
+              return true;
+            },
+            Escape: () => {
+              const mention = mentionSuggestionPluginKey.getState(this.editor.state) as
+                { active?: boolean } | undefined;
+              const emoji = emojiSuggestionPluginKey.getState(this.editor.state) as
+                { active?: boolean } | undefined;
+              if (mention?.active || emoji?.active) return false;
+              if (editingRef.current && cancelRef.current) {
+                cancelRef.current();
+                return true;
+              }
+              return false;
+            },
+          };
+        },
+      }),
+    [],
+  );
+
+  const editor = useEditor({
+    shouldRerenderOnTransaction: true,
+    editorProps: {
+      handlePaste: (_view, event) => {
+        const files = transferFiles(event.clipboardData);
+        if (files.length === 0 || !uploadRef.current) return false;
+        event.preventDefault();
+        void uploadFiles(files);
+        return true;
+      },
+      handleDrop: (_view, event) => {
+        const files = transferFiles((event as DragEvent).dataTransfer);
+        if (files.length === 0 || !uploadRef.current) return false;
+        event.preventDefault();
+        void uploadFiles(files);
+        return true;
+      },
+    },
+    extensions: [
+      ...createEditorExtensions(),
+      Placeholder.configure({
+        placeholder: placeholder ?? (isDm ? `Message ${channelName}` : `Message #${channelName}`),
+      }),
+      submitExtension,
+      ...(isDm ? [] : [mentionExtension]),
+    ],
+    content: editing
+      ? flattenMentions(initialContent ?? '')
+      : draftKey
+        ? useDraftStore.getState().getDraft(draftKey)
+        : '',
+    onUpdate: ({ editor: ed }) => {
+      onTyping?.();
+      if (!draftKey) return;
+      if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = setTimeout(() => {
+        useDraftStore.getState().setDraft(draftKey, ed.storage.markdown.getMarkdown());
+      }, DRAFT_SAVE_DEBOUNCE_MS);
+    },
+  });
+
+  const [showSchedule, setShowSchedule] = useState(false);
+  const [customSendAt, setCustomSendAt] = useState('');
+  // Stamped when the menu opens: reading the clock during render makes the
+  // component impure, and a minute from *now* is only meaningful at that moment.
+  const [earliestSendAt, setEarliestSendAt] = useState('');
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const scheduleMenuRef = useRef<HTMLDivElement>(null);
+  useOnClickOutside(scheduleMenuRef, () => setShowSchedule(false), showSchedule);
+  useEscapeToClose(() => setShowSchedule(false), showSchedule);
+  const scheduleMessage = useScheduleMessage(workspaceId ?? '', instanceUrl);
+  const canSchedule = !!workspaceId && !!scheduleTarget && !editing;
+
+  const handleSchedule = useCallback(
+    async (sendAt: Date) => {
+      if (!editor || !scheduleTarget) return;
+      const markdown = editor.storage.markdown.getMarkdown().trim();
+      if (!markdown) return;
+      try {
+        await scheduleMessage.mutateAsync({ target: scheduleTarget, content: markdown, sendAt });
+        editor.commands.clearContent();
+        if (draftKey) useDraftStore.getState().clearDraft(draftKey);
+        setShowSchedule(false);
+        setCustomSendAt('');
+        setScheduleError(null);
+        toast.success(`Scheduled for ${formatDateTime(sendAt)}`);
+      } catch (err) {
+        toast.error(toUserMessage(err, 'Could not schedule that message'));
+      }
+    },
+    [editor, scheduleTarget, scheduleMessage, draftKey],
+  );
+
+  const handleSend = useCallback(async () => {
+    if (!editor) return;
+    const markdown = editor.storage.markdown.getMarkdown().trim();
+    if (!markdown) return;
+    editor.commands.clearContent();
+    editor.commands.focus();
+    if (draftKey) useDraftStore.getState().clearDraft(draftKey);
+    try {
+      await onSend(markdown);
+    } catch {
+      editor.commands.setContent(markdown);
+      if (draftKey) useDraftStore.getState().setDraft(draftKey, markdown);
+    }
+  }, [editor, onSend, draftKey]);
+
+  useEffect(() => {
+    sendRef.current = () => {
+      void handleSend();
+    };
+  }, [handleSend]);
+
+  useEffect(() => {
+    if (editing && editor) editor.commands.focus('end');
+  }, [editing, editor]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    void uploadFiles(Array.from(e.target.files ?? []));
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const isEmpty = !editor || editor.isEmpty;
+
+  return (
+    // The bottom padding clears the iOS home indicator; without it the send
+    // button sits under it and cannot be tapped.
+    <div className={editing ? 'mt-1' : 'px-4 pb-4 max-sm:pb-[max(1rem,env(safe-area-inset-bottom))]'}>
+      {onFileUpload && (
+        <input
+          aria-label="Attach files"
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={handleFileChange}
+        />
+      )}
+      <div className="@container bg-surface border border-line rounded-xl">
+        <div className="px-4 pt-3 pb-1">
+          <EditorContent editor={editor} className="tiptap-editor" />
+        </div>
+
+        <div className="flex items-start justify-between gap-1 px-3 pb-2 pt-1">
+          <div className="flex flex-wrap items-center gap-0.5 min-w-0">
+            {onFileUpload && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  aria-label="Upload file"
+                  className="p-1 text-muted hover:text-fg-soft disabled:text-faint transition cursor-pointer rounded hover:bg-raised/60"
+                >
+                  {uploading ? (
+                    <div className="w-3.5 h-3.5 border-2 border-line-strong/30 border-t-slate-400 rounded-full animate-spin" />
+                  ) : (
+                    <Paperclip className="w-3.5 h-3.5" />
+                  )}
+                </button>
+                <div className="w-px h-4 bg-elevated/60 mx-0.5" />
+              </>
+            )}
+            {/* Twelve formatting buttons in a composer this narrow is more
+                chrome than composer, and markdown shortcuts still work while it
+                is folded away. */}
+            <div className={showFormatting ? 'contents' : '@max-md:hidden contents'}>
+              <FormattingToolbar editor={editor} />
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowFormatting((open) => !open)}
+              aria-label={showFormatting ? 'Hide formatting' : 'Show formatting'}
+              aria-pressed={showFormatting}
+              data-qa="composer-formatting-toggle"
+              className="@md:hidden p-1 text-muted hover:text-fg-soft transition cursor-pointer rounded hover:bg-raised/60"
+            >
+              <Type className="w-3.5 h-3.5" />
+            </button>
+            <div className="relative">
+              <button
+                ref={emojiBtnRef}
+                type="button"
+                onClick={() => setShowEmoji((v) => !v)}
+                aria-label="Insert emoji"
+                className="p-1 text-muted hover:text-fg-soft transition cursor-pointer rounded hover:bg-raised/60"
+              >
+                <SmilePlus className="w-3.5 h-3.5" />
+              </button>
+              {showEmoji && (
+                <EmojiPicker
+                  anchorRef={emojiBtnRef}
+                  onSelect={(emoji) => {
+                    editor?.chain().focus().insertContent(emoji).run();
+                    setShowEmoji(false);
+                  }}
+                  onClose={() => setShowEmoji(false)}
+                />
+              )}
+            </div>
+          </div>
+
+          {editing ? (
+            <div className="flex shrink-0 items-center gap-2 text-xs">
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={isEmpty}
+                data-qa="message-edit-save"
+                className="rounded bg-purple-600 px-2.5 py-1 font-medium text-white transition hover:bg-purple-500 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={onCancel}
+                className="rounded px-2.5 py-1 text-muted transition hover:text-fg"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <div className="flex shrink-0 items-center gap-0.5">
+              {canSchedule && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEarliestSendAt(toLocalInputValue(new Date(Date.now() + 60_000)));
+                      setShowSchedule((open) => !open);
+                    }}
+                    disabled={isEmpty}
+                    aria-label="Schedule message"
+                    aria-expanded={showSchedule}
+                    data-qa="schedule-open"
+                    className="p-1 text-muted hover:text-fg disabled:text-faint transition cursor-pointer disabled:cursor-not-allowed rounded hover:bg-raised/60"
+                    title="Send later"
+                  >
+                    <Clock className="w-3.5 h-3.5" />
+                  </button>
+                  {showSchedule && (
+                    <div
+                      ref={scheduleMenuRef}
+                      data-qa="schedule-menu"
+                      className="absolute bottom-full right-0 mb-2 w-64 bg-surface border border-line rounded-lg shadow-xl py-1 z-20"
+                    >
+                      {SCHEDULE_PRESETS.map((preset) => (
+                        <button
+                          key={preset.label}
+                          type="button"
+                          onClick={() => void handleSchedule(preset.at())}
+                          data-qa="schedule-preset"
+                          className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left text-sm text-fg-dim hover:bg-raised/60 transition cursor-pointer"
+                        >
+                          <span>{preset.label}</span>
+                          <span className="text-[11px] text-subtle">{formatScheduleHint(preset.at())}</span>
+                        </button>
+                      ))}
+
+                      <div className="mt-1 border-t border-line/70 px-3 py-2">
+                        <label
+                          htmlFor={`schedule-custom-${draftKey ?? 'composer'}`}
+                          className="block text-[11px] uppercase tracking-wider text-muted mb-1"
+                        >
+                          Pick a time
+                        </label>
+                        <input
+                          id={`schedule-custom-${draftKey ?? 'composer'}`}
+                          type="datetime-local"
+                          value={customSendAt}
+                          min={earliestSendAt}
+                          onChange={(e) => {
+                            setCustomSendAt(e.target.value);
+                            setScheduleError(null);
+                          }}
+                          data-qa="schedule-custom-input"
+                          className="w-full px-2 py-1.5 bg-raised/50 border border-line-strong rounded text-sm text-fg focus:outline-none focus:ring-2 focus:ring-purple-500 [color-scheme:dark]"
+                        />
+                        {scheduleError && (
+                          <p className="mt-1 text-[11px] text-danger" data-qa="schedule-error">
+                            {scheduleError}
+                          </p>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const at = new Date(customSendAt);
+                            if (!customSendAt || Number.isNaN(at.getTime())) {
+                              setScheduleError('Pick a date and time first');
+                              return;
+                            }
+                            if (at.getTime() <= Date.now()) {
+                              setScheduleError('That time has already passed');
+                              return;
+                            }
+                            void handleSchedule(at);
+                          }}
+                          data-qa="schedule-custom-submit"
+                          className="mt-2 w-full px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white text-sm font-medium rounded transition cursor-pointer"
+                        >
+                          Schedule
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={handleSend}
+                disabled={isEmpty}
+                className="p-1 text-accent hover:text-accent-soft disabled:text-faint transition cursor-pointer disabled:cursor-not-allowed rounded hover:bg-raised/60"
+                title="Send (Enter)"
+              >
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
